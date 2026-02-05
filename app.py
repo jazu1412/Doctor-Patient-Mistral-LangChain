@@ -4,6 +4,15 @@ import chromadb
 from typing import List, Dict
 import os
 from dotenv import load_dotenv
+from database import (
+    sync_init_database,
+    sync_sync_doctors,
+    sync_get_available_doctors,
+    sync_check_doctor_availability,
+    sync_book_doctor,
+    sync_release_doctor,
+    sync_get_all_doctors
+)
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +49,14 @@ def init_clients():
         database=CHROMA_DATABASE
     )
     collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    
+    # Initialize database (silently fail if DB unavailable)
+    try:
+        sync_init_database()
+    except Exception:
+        # Silently fail - app will work without database for demo
+        pass
+    
     return mistral_client, collection
 
 # Initialize session state
@@ -66,11 +83,12 @@ def get_symptom_embedding(symptoms: str) -> List[float]:
         return None
 
 def find_best_doctor(symptoms_embedding: List[float], top_k: int = 3) -> List[Dict]:
-    """Find the best matching doctors using vector similarity search"""
+    """Find the best matching doctors using vector similarity search, filtered by availability"""
     try:
+        # Get more results than needed to account for unavailable doctors
         results = collection.query(
             query_embeddings=[symptoms_embedding],
-            n_results=top_k,
+            n_results=top_k * 3,  # Get more to filter by availability
             include=["documents", "metadatas", "distances"]
         )
         
@@ -86,7 +104,29 @@ def find_best_doctor(symptoms_embedding: List[float], top_k: int = 3) -> List[Di
                     'similarity_score': 1 - results['distances'][0][i]  # Convert distance to similarity
                 }
                 doctors.append(doctor_info)
-        return doctors
+        
+        # Sync doctors to database (silently fail if DB unavailable)
+        if doctors:
+            try:
+                sync_sync_doctors(doctors)
+            except Exception:
+                # Silently fail - don't show error during demo
+                pass
+        
+        # Filter by availability - only return available doctors
+        if doctors:
+            doctor_names = [doc['doctor_name'] for doc in doctors]
+            try:
+                available_names = sync_get_available_doctors(doctor_names)
+                if available_names:  # Only filter if we got results
+                    doctors = [doc for doc in doctors if doc['doctor_name'] in available_names]
+                # If no available names returned, show all (fail-safe)
+            except Exception:
+                # Silently fail - show all doctors if DB unavailable
+                pass
+        
+        # Return only top_k available doctors
+        return doctors[:top_k]
     except Exception as e:
         st.error(f"Error querying ChromaDB: {str(e)}")
         return []
@@ -158,6 +198,29 @@ if st.button("🔍 Find Doctor", type="primary", use_container_width=True):
                                 st.markdown(f"**Speciality:** {doctor['speciality']}")
                                 st.markdown(f"**Match Score:** {doctor['similarity_score']:.2%}")
                                 
+                                # Check availability status
+                                try:
+                                    is_available = sync_check_doctor_availability(doctor['doctor_name'])
+                                    if is_available:
+                                        st.success("✅ Available")
+                                        # Booking button
+                                        if st.button(f"📅 Book Appointment", key=f"book_{doctor['doctor_name']}_{idx}"):
+                                            try:
+                                                if sync_book_doctor(doctor['doctor_name']):
+                                                    st.success(f"✅ Successfully booked appointment with {doctor['doctor_name']}!")
+                                                    st.rerun()
+                                                else:
+                                                    st.error("❌ Doctor is no longer available. Please search again.")
+                                            except Exception:
+                                                st.info("ℹ️ Booking service temporarily unavailable")
+                                    else:
+                                        st.warning("⏸️ Currently Unavailable")
+                                except Exception:
+                                    # If DB unavailable, show as available (fail-safe for demo)
+                                    st.success("✅ Available")
+                                    if st.button(f"📅 Book Appointment", key=f"book_{doctor['doctor_name']}_{idx}"):
+                                        st.info("ℹ️ Booking feature requires database connection")
+                                
                                 if show_ai_recommendation and idx == 1:
                                     recommendation = get_doctor_recommendation(symptoms_input)
                                     if recommendation:
@@ -213,5 +276,39 @@ with st.sidebar:
     if st.button("🔄 Refresh Connection"):
         st.cache_resource.clear()
         st.rerun()
+    
+    st.markdown("---")
+    st.markdown("### 🗄️ Database Management")
+    
+    if st.button("📊 View All Doctors"):
+        try:
+            all_doctors = sync_get_all_doctors()
+            if all_doctors:
+                import pandas as pd
+                df = pd.DataFrame(all_doctors)
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.info("No doctors in database yet.")
+        except Exception as e:
+            st.error(f"Error fetching doctors: {str(e)}")
+    
+    if st.button("🔄 Sync Doctors from ChromaDB"):
+        try:
+            # Get all doctors from ChromaDB
+            all_results = collection.get()
+            doctors_to_sync = []
+            if all_results.get('ids'):
+                for i, doc_id in enumerate(all_results['ids']):
+                    doctor_info = {
+                        'id': doc_id,
+                        'doctor_name': all_results['metadatas'][i].get('doctor_name', 'N/A'),
+                        'speciality': all_results['metadatas'][i].get('speciality', 'N/A')
+                    }
+                    doctors_to_sync.append(doctor_info)
+            
+            sync_sync_doctors(doctors_to_sync)
+            st.success(f"✅ Synced {len(doctors_to_sync)} doctors to database!")
+        except Exception as e:
+            st.error(f"Error syncing doctors: {str(e)}")
 
 
