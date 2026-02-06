@@ -13,6 +13,12 @@ from database import (
     sync_release_doctor,
     sync_get_all_doctors
 )
+from patient_processor import (
+    process_patient_dataset,
+    search_similar_cases,
+    get_collection_stats,
+    get_patient_collection
+)
 
 # Load environment variables
 load_dotenv()
@@ -151,11 +157,22 @@ Keep the response concise (2-3 sentences)."""
 st.set_page_config(
     page_title="Doctor-Patient Matching System",
     page_icon="🏥",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.title("🏥 Doctor-Patient Matching System")
-st.markdown("Enter your symptoms below to find the best matching doctor for your needs.")
+# Navigation
+st.sidebar.title("🏥 Navigation")
+page = st.sidebar.radio(
+    "Select Page",
+    ["🏠 Home - Doctor Matching", "🔬 Clinical Decision Support", "⚙️ Admin Panel"],
+    index=0
+)
+
+# Main content based on selected page
+if page == "🏠 Home - Doctor Matching":
+    st.title("🏥 Doctor-Patient Matching System")
+    st.markdown("Enter your symptoms below to find the best matching doctor for your needs.")
 
 # Input section
 col1, col2 = st.columns([2, 1])
@@ -253,62 +270,395 @@ if st.button("🔍 Find Doctor", type="primary", use_container_width=True):
             else:
                 st.error("Failed to process your symptoms. Please try again.")
 
-# Sidebar with info
-with st.sidebar:
-    st.markdown("### ℹ️ How it works")
-    st.markdown("""
-    1. **Enter Symptoms**: Describe your symptoms in detail
-    2. **AI Analysis**: Your symptoms are converted to embeddings
-    3. **Vector Search**: We search for doctors with matching specialities
-    4. **Best Match**: The system recommends the most suitable doctor
+elif page == "🔬 Clinical Decision Support":
+    st.title("🔬 Clinical Decision Support")
+    st.markdown("Search for similar past patient cases to aid in clinical decision making.")
     
-    The matching is based on semantic similarity between your symptoms 
-    and doctor specialities using advanced AI embeddings.
-    """)
+    # Get collection stats
+    stats = get_collection_stats()
+    if stats['success']:
+        st.info(f"📊 Patient Cases Database: {stats['count']} cases available")
+    else:
+        st.warning("⚠️ Patient cases database not available. Please upload dataset in Admin Panel.")
     
-    st.markdown("### 📊 System Info")
-    st.code(f"""
-    Model: {CHAT_MODEL}
-    Embedding: {EMBEDDING_MODEL}
-    Database: {CHROMA_DATABASE}
-    """)
+    # Search interface
+    col1, col2 = st.columns([2, 1])
     
-    if st.button("🔄 Refresh Connection"):
-        st.cache_resource.clear()
-        st.rerun()
+    with col1:
+        patient_symptoms = st.text_area(
+            "Enter Patient Symptoms:",
+            height=150,
+            placeholder="e.g., 45-year-old male presenting with chest pain, shortness of breath, and sweating for the past 2 hours..."
+        )
     
+    with col2:
+        st.markdown("### Search Options")
+        num_cases = st.slider("Number of similar cases", 1, 10, 5)
+        show_details = st.checkbox("Show detailed case information", value=True)
+    
+    if st.button("🔍 Search Similar Cases", type="primary", use_container_width=True):
+        if not patient_symptoms.strip():
+            st.warning("Please enter patient symptoms before searching.")
+        else:
+            with st.spinner("Searching for similar past cases..."):
+                similar_cases = search_similar_cases(patient_symptoms, mistral_client, top_k=num_cases)
+                
+                if similar_cases:
+                    st.success(f"Found {len(similar_cases)} similar case(s)!")
+                    
+                    for idx, case in enumerate(similar_cases, 1):
+                        with st.container():
+                            st.markdown(f"### 📋 Case {idx} (Similarity: {case['similarity_score']:.2%})")
+                            
+                            # Display case document - FULL TEXT, no truncation
+                            with st.expander("📄 Case Details (Full Text)", expanded=True):
+                                # Use text_area for better display of long text
+                                st.text_area(
+                                    "Complete Patient Case Information:",
+                                    value=case['document'],
+                                    height=300,
+                                    key=f"case_{idx}_full",
+                                    label_visibility="collapsed"
+                                )
+                                # Also show as markdown for better formatting
+                                st.markdown(f"**Full Case Text:**")
+                                st.markdown(f"```\n{case['document']}\n```")
+                            
+                            # Display metadata if available
+                            if show_details and case['metadata']:
+                                with st.expander("🔍 Additional Information"):
+                                    metadata = case['metadata']
+                                    # Display key fields
+                                    key_fields = ['patient_id', 'diagnosis', 'treatment', 'age', 'gender', 'medical_history']
+                                    for field in key_fields:
+                                        if field in metadata:
+                                            st.markdown(f"**{field.replace('_', ' ').title()}:** {metadata[field]}")
+                                    
+                                    # Show all metadata in a table
+                                    if len(metadata) > len(key_fields):
+                                        st.markdown("**All Metadata:**")
+                                        import pandas as pd
+                                        meta_df = pd.DataFrame([metadata])
+                                        st.dataframe(meta_df.T, use_container_width=True)
+                            
+                            st.divider()
+                    
+                    # AI Analysis of similar cases
+                    if len(similar_cases) > 0:
+                        st.markdown("---")
+                        st.markdown("### 💡 AI Analysis")
+                        try:
+                            # Use full document text for AI analysis (not truncated)
+                            cases_summary = "\n".join([f"Case {i+1}: {case['document']}" for i, case in enumerate(similar_cases[:3])])
+                            analysis_prompt = f"""Based on the current patient symptoms: "{patient_symptoms}"
+
+And these similar past cases:
+{cases_summary}
+
+Provide a brief clinical analysis comparing the current case with past cases. Highlight:
+1. Similarities in symptoms and presentation
+2. Potential diagnosis considerations
+3. Treatment approaches that worked in similar cases
+
+Keep the response concise and clinically relevant."""
+                            
+                            analysis_response = mistral_client.chat.complete(
+                                model=CHAT_MODEL,
+                                messages=[{"role": "user", "content": analysis_prompt}]
+                            )
+                            
+                            st.info(analysis_response.choices[0].message.content)
+                        except Exception as e:
+                            st.warning(f"Could not generate AI analysis: {str(e)}")
+                else:
+                    st.error("No similar cases found. The database may be empty or symptoms don't match any cases.")
+    
+    # Show collection info
     st.markdown("---")
-    st.markdown("### 🗄️ Database Management")
+    st.markdown("### 📚 About Clinical Decision Support")
+    st.markdown("""
+    This feature uses vector similarity search to find past patient cases with similar symptoms.
+    It helps clinicians by:
+    - Finding similar historical cases
+    - Comparing current patient with past cases
+    - Providing AI-powered analysis of similarities
+    - Aiding in diagnosis and treatment decisions
+    """)
+
+elif page == "⚙️ Admin Panel":
+    st.title("⚙️ Admin Panel")
+    st.markdown("Manage patient dataset and system configuration.")
     
-    if st.button("📊 View All Doctors"):
-        try:
-            all_doctors = sync_get_all_doctors()
-            if all_doctors:
-                import pandas as pd
-                df = pd.DataFrame(all_doctors)
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.info("No doctors in database yet.")
-        except Exception as e:
-            st.error(f"Error fetching doctors: {str(e)}")
+    # Admin tabs
+    tab1, tab2, tab3 = st.tabs(["📤 Upload Dataset", "📊 Collection Stats", "🔗 ChromaDB Info"])
     
-    if st.button("🔄 Sync Doctors from ChromaDB"):
-        try:
-            # Get all doctors from ChromaDB
-            all_results = collection.get()
-            doctors_to_sync = []
-            if all_results.get('ids'):
-                for i, doc_id in enumerate(all_results['ids']):
-                    doctor_info = {
-                        'id': doc_id,
-                        'doctor_name': all_results['metadatas'][i].get('doctor_name', 'N/A'),
-                        'speciality': all_results['metadatas'][i].get('speciality', 'N/A')
-                    }
-                    doctors_to_sync.append(doctor_info)
+    with tab1:
+        st.markdown("### 📤 Upload PMC-Patients Dataset")
+        st.markdown("""
+        Upload the PMC-Patients dataset CSV file to create embeddings for clinical decision support.
+        
+        **Dataset Source:** [Kaggle - PMC-Patients Dataset](https://www.kaggle.com/datasets/priyamchoksi/pmc-patients-dataset-for-clinical-decision-support)
+        """)
+        
+        # Option to use file path or upload
+        use_file_path = st.checkbox("Use file path instead of upload (for large files)", value=False,
+                                    help="If upload fails due to size limits, use this option to process file from your filesystem")
+        
+        uploaded_file = None
+        file_path_input = None
+        
+        if use_file_path:
+            file_path_input = st.text_input(
+                "Enter full path to CSV file",
+                placeholder="/path/to/PMC-Patients.csv",
+                help="Enter the absolute path to your CSV file on your computer"
+            )
+            if file_path_input and os.path.exists(file_path_input):
+                st.success(f"✅ File found: {file_path_input}")
+            elif file_path_input:
+                st.error(f"❌ File not found: {file_path_input}")
+        else:
+            uploaded_file = st.file_uploader(
+                "Choose CSV file",
+                type=['csv'],
+                help="Upload the PMC-Patients.csv file from the Kaggle dataset"
+            )
             
-            sync_sync_doctors(doctors_to_sync)
-            st.success(f"✅ Synced {len(doctors_to_sync)} doctors to database!")
+            if uploaded_file is not None:
+                file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+                if file_size_mb > 200:
+                    st.warning(f"⚠️ **File is {file_size_mb:.1f} MB. If upload fails, check `.streamlit/config.toml` and restart Streamlit.**")
+        
+        # Determine which file source to use and get file info
+        file_ready = False
+        file_size_mb = 0
+        
+        if use_file_path and file_path_input and os.path.exists(file_path_input):
+            file_ready = True
+            file_size_mb = os.path.getsize(file_path_input) / (1024 * 1024)
+        elif uploaded_file is not None:
+            file_ready = True
+            file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+        
+        if file_ready:
+            
+            # Show file info
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("File Size", f"{file_size_mb:.1f} MB")
+            with col2:
+                st.metric("Status", "Ready to Process" if file_size_mb > 0 else "Empty")
+            
+            # Warning for large files
+            if file_size_mb > 200:
+                st.warning(f"⚠️ **Large File Detected ({file_size_mb:.1f} MB)**\n\n"
+                          f"This file is quite large. Processing may take a significant amount of time and API costs.\n\n"
+                          f"**Estimated Processing Time:** {file_size_mb * 0.5:.0f}-{file_size_mb * 2:.0f} minutes\n"
+                          f"**Recommendation:** Consider processing a sample first to test.")
+            
+            # Processing options
+            st.markdown("### ⚙️ Processing Options")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                process_sample = st.checkbox("Process Sample First", value=file_size_mb > 200, 
+                                            help="Process only first N rows to test")
+                if process_sample:
+                    sample_size = st.number_input("Sample Size", min_value=100, max_value=10000, 
+                                                 value=1000, step=100,
+                                                 help="Number of rows to process in sample")
+            
+            with col2:
+                process_full = st.checkbox("Process Full Dataset", value=not (file_size_mb > 200),
+                                          help="Process entire dataset (may take hours for large files)")
+            
+            # Determine file path (will be set when processing starts)
+            tmp_path = None
+            
+            # Process button
+            if (process_sample or process_full) and st.button("🚀 Process Dataset", type="primary"):
+                # Determine file path
+                if use_file_path and file_path_input:
+                    tmp_path = file_path_input
+                else:
+                    # Save uploaded file temporarily
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
+                        tmp_file.write(uploaded_file.getvalue())
+                        tmp_path = tmp_file.name
+                
+                max_rows = sample_size if process_sample and not process_full else None
+                
+                if max_rows:
+                    st.info(f"📝 Processing sample: First {max_rows:,} rows")
+                else:
+                    st.info(f"📝 Processing full dataset (this may take a while for {file_size_mb:.1f} MB file)")
+                
+                # Create progress containers
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                try:
+                    result = process_patient_dataset(tmp_path, mistral_client, progress_bar, status_text, max_rows)
+                    
+                    status_text.empty()
+                    
+                    if result['success']:
+                        st.success(f"""
+                        ✅ **Processing Complete!**
+                        - Processed: {result['processed']:,} records
+                        - Failed: {result['failed']:,} records
+                        - Total in collection: {result['collection_count']:,} cases
+                        - File size: {result.get('file_size_mb', 0):.1f} MB
+                        """)
+                        
+                        if max_rows and process_full:
+                            st.info("💡 Sample processing complete. Uncheck 'Process Sample First' and check 'Process Full Dataset' to continue with the rest.")
+                    else:
+                        st.error(f"❌ Error processing dataset: {result.get('error', 'Unknown error')}")
+                        if 'Memory' in result.get('error', ''):
+                            st.warning("💡 **Memory Error**: Try processing a smaller sample first.")
+                
+                except Exception as e:
+                    status_text.empty()
+                    st.error(f"❌ Processing failed: {str(e)}")
+                    if 'memory' in str(e).lower() or 'Memory' in str(e):
+                        st.warning("💡 **Memory Issue**: The file is too large to process at once. Try processing a sample first.")
+                
+                finally:
+                    # Clean up temp file (only if it was uploaded, not if using file path)
+                    if not use_file_path and tmp_path and os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except:
+                            pass
+        
+        st.markdown("---")
+        st.markdown("### 📝 Instructions")
+        st.markdown("""
+        1. Download the PMC-Patients dataset from [Kaggle](https://www.kaggle.com/datasets/priyamchoksi/pmc-patients-dataset-for-clinical-decision-support)
+        2. Extract the CSV file (PMC-Patients.csv)
+        3. Upload it using the file uploader above
+        4. **For large files (>200MB)**: 
+           - Start with "Process Sample First" to test (recommended)
+           - Then process the full dataset
+        5. Click "Process Dataset" to create embeddings
+        6. The embeddings will be stored in ChromaDB collection: `patient_cases`
+        
+        **Note:** Large files (500MB+) may take several hours to process. The system processes data in chunks to manage memory efficiently.
+        """)
+    
+    with tab2:
+        st.markdown("### 📊 Collection Statistics")
+        
+        # Patient collection stats
+        patient_stats = get_collection_stats()
+        if patient_stats['success']:
+            st.metric("Patient Cases", patient_stats['count'])
+            st.info(f"Collection: `{patient_stats['collection_name']}`")
+        else:
+            st.error(f"Error: {patient_stats.get('error', 'Unknown error')}")
+        
+        # Doctor collection stats
+        st.markdown("---")
+        st.markdown("### Doctor Collection")
+        try:
+            doctor_count = collection.count()
+            st.metric("Doctor Records", doctor_count)
+            st.info(f"Collection: `{COLLECTION_NAME}`")
         except Exception as e:
-            st.error(f"Error syncing doctors: {str(e)}")
+            st.error(f"Error: {str(e)}")
+    
+    with tab3:
+        st.markdown("### 🔗 ChromaDB Connection Info")
+        st.code(f"""
+        Database: {CHROMA_DATABASE}
+        Tenant: {CHROMA_TENANT}
+        Doctor Collection: {COLLECTION_NAME}
+        Patient Collection: patient_cases
+        """)
+        
+        st.markdown("### 🌐 ChromaDB Web Interface")
+        st.markdown(f"""
+        Access your ChromaDB collections via the web interface:
+        - [ChromaDB Console](https://www.trychroma.com/vmjs1412/aws-us-east-1/{CHROMA_DATABASE})
+        - Doctor Embeddings: [View Collection](https://www.trychroma.com/vmjs1412/aws-us-east-1/{CHROMA_DATABASE}/collections/{COLLECTION_NAME})
+        - Patient Cases: [View Collection](https://www.trychroma.com/vmjs1412/aws-us-east-1/{CHROMA_DATABASE}/collections/patient_cases)
+        """)
+        
+        if st.button("🔄 Refresh Stats"):
+            st.rerun()
+
+# Sidebar with info (only show on home page)
+if page == "🏠 Home - Doctor Matching":
+    with st.sidebar:
+        st.markdown("### ℹ️ How it works")
+        st.markdown("""
+        1. **Enter Symptoms**: Describe your symptoms in detail
+        2. **AI Analysis**: Your symptoms are converted to embeddings
+        3. **Vector Search**: We search for doctors with matching specialities
+        4. **Best Match**: The system recommends the most suitable doctor
+        
+        The matching is based on semantic similarity between your symptoms 
+        and doctor specialities using advanced AI embeddings.
+        """)
+        
+        st.markdown("### 📊 System Info")
+        st.code(f"""
+        Model: {CHAT_MODEL}
+        Embedding: {EMBEDDING_MODEL}
+        Database: {CHROMA_DATABASE}
+        """)
+        
+        if st.button("🔄 Refresh Connection"):
+            st.cache_resource.clear()
+            st.rerun()
+        
+        st.markdown("---")
+        st.markdown("### 🗄️ Database Management")
+        
+        if st.button("📊 View All Doctors"):
+            try:
+                all_doctors = sync_get_all_doctors()
+                if all_doctors:
+                    import pandas as pd
+                    df = pd.DataFrame(all_doctors)
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.info("No doctors in database yet.")
+            except Exception as e:
+                st.error(f"Error fetching doctors: {str(e)}")
+        
+        if st.button("🔄 Sync Doctors from ChromaDB"):
+            try:
+                # Get all doctors from ChromaDB
+                all_results = collection.get()
+                doctors_to_sync = []
+                if all_results.get('ids'):
+                    for i, doc_id in enumerate(all_results['ids']):
+                        doctor_info = {
+                            'id': doc_id,
+                            'doctor_name': all_results['metadatas'][i].get('doctor_name', 'N/A'),
+                            'speciality': all_results['metadatas'][i].get('speciality', 'N/A')
+                        }
+                        doctors_to_sync.append(doctor_info)
+                
+                sync_sync_doctors(doctors_to_sync)
+                st.success(f"✅ Synced {len(doctors_to_sync)} doctors to database!")
+            except Exception as e:
+                st.error(f"Error syncing doctors: {str(e)}")
+else:
+    # Sidebar info for other pages
+    with st.sidebar:
+        st.markdown("### 📊 System Info")
+        st.code(f"""
+        Model: {CHAT_MODEL}
+        Embedding: {EMBEDDING_MODEL}
+        Database: {CHROMA_DATABASE}
+        """)
+        
+        if st.button("🔄 Refresh Connection"):
+            st.cache_resource.clear()
+            st.rerun()
 
 
