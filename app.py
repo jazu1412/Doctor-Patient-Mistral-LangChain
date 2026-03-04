@@ -205,15 +205,14 @@ if st.button("🔍 Find Doctor", type="primary", use_container_width=True):
                 if doctors:
                     st.success(f"Found {len(doctors)} matching doctor(s)!")
                     
-                    # Display results
+                    # Display results (without explicit percentage match score)
                     for idx, doctor in enumerate(doctors, 1):
                         with st.container():
-                            col1, col2 = st.columns([3, 1])
+                            col1, _ = st.columns([3, 1])
                             
                             with col1:
                                 st.markdown(f"### 👨‍⚕️ Doctor {idx}: {doctor['doctor_name']}")
                                 st.markdown(f"**Speciality:** {doctor['speciality']}")
-                                st.markdown(f"**Match Score:** {doctor['similarity_score']:.2%}")
                                 
                                 # Check availability status
                                 try:
@@ -244,16 +243,6 @@ if st.button("🔍 Find Doctor", type="primary", use_container_width=True):
                                         with st.expander("💡 AI Recommendation", expanded=True):
                                             st.write(recommendation)
                             
-                            with col2:
-                                match_color = "green" if doctor['similarity_score'] > 0.7 else "orange" if doctor['similarity_score'] > 0.5 else "red"
-                                st.markdown(
-                                    f'<div style="text-align: center; padding: 20px; background-color: {match_color}20; border-radius: 10px; border: 2px solid {match_color};">'
-                                    f'<h2 style="color: {match_color}; margin: 0;">{doctor["similarity_score"]:.0%}</h2>'
-                                    f'<p style="margin: 5px 0 0 0; color: {match_color};">Match</p>'
-                                    f'</div>',
-                                    unsafe_allow_html=True
-                                )
-                            
                             st.divider()
                     
                     # Show selected doctor prominently
@@ -263,7 +252,7 @@ if st.button("🔍 Find Doctor", type="primary", use_container_width=True):
                         st.markdown("### ✅ Recommended Doctor")
                         st.info(
                             f"**{best_doctor['doctor_name']}** - {best_doctor['speciality']}\n\n"
-                            f"Based on your symptoms, this doctor has the highest match score ({best_doctor['similarity_score']:.2%})."
+                            "Based on your symptoms, this doctor is recommended as the best available match."
                         )
                 else:
                     st.error("No matching doctors found. Please try rephrasing your symptoms.")
@@ -308,7 +297,7 @@ elif page == "🔬 Clinical Decision Support":
                     
                     for idx, case in enumerate(similar_cases, 1):
                         with st.container():
-                            st.markdown(f"### 📋 Case {idx} (Similarity: {case['similarity_score']:.2%})")
+                            st.markdown(f"### 📋 Case {idx}")
                             
                             # Display case document - FULL TEXT, no truncation
                             with st.expander("📄 Case Details (Full Text)", expanded=True):
