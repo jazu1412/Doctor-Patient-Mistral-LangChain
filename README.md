@@ -1,4 +1,4 @@
-#MediMatch AI - Symptom-Based Doctor Matching AI Agent
+# MediMatch AI - Symptom-Based Doctor Matching AI Agent
 
 A web application that matches patients with doctors based on symptoms using Mistral AI embeddings and ChromaDB vector search.
 
