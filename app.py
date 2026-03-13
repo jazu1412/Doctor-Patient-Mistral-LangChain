@@ -1,6 +1,7 @@
 import streamlit as st
 from mistralai import Mistral
 import chromadb
+import logging
 from typing import List, Dict
 import os
 from dotenv import load_dotenv
@@ -11,14 +12,49 @@ from database import (
     sync_check_doctor_availability,
     sync_book_doctor,
     sync_release_doctor,
-    sync_get_all_doctors
+    sync_get_all_doctors,
 )
 from patient_processor import (
     process_patient_dataset,
     search_similar_cases,
     get_collection_stats,
-    get_patient_collection
+    get_patient_collection,
 )
+from zipcodes_ca import ZIP_CODES_CA
+from datetime import date, time
+
+# Cloud SQL appointments (optional)
+try:
+    from cloud_sql_appointments import (
+        is_cloud_sql_available,
+        get_cloud_sql_status,
+        get_or_create_user,
+        get_doctor_id_by_name,
+        get_available_slots,
+        book_appointment,
+        list_appointments_for_user,
+        sync_doctors_to_cloud_sql,
+        SLOT_STARTS,
+        DEFAULT_USER_EMAIL,
+    )
+except ImportError:
+    def is_cloud_sql_available(): return False
+    def get_cloud_sql_status(): return "Not installed (pip install pymysql)"
+    def get_or_create_user(*a, **k): return None
+    def get_doctor_id_by_name(*a, **k): return None
+    def get_available_slots(*a, **k): return []
+    def book_appointment(*a, **k): return (False, "Cloud SQL not installed")
+    def list_appointments_for_user(*a, **k): return []
+    def sync_doctors_to_cloud_sql(*a, **k): return (0, "Cloud SQL not installed")
+    SLOT_STARTS = []
+    DEFAULT_USER_EMAIL = "jas@gmail.com"
+
+# Use same logger as cloud_sql_appointments so logs go to cloud_sql_appointments.log
+_log = logging.getLogger("cloud_sql_appointments")
+
+# Pre-computed sorted ZIP list for stable grouping
+ZIP_LIST = sorted(ZIP_CODES_CA)
+ZIP_GROUP_SIZE = 5  # number of nearby ZIPs to associate with each doctor
 
 # Load environment variables
 load_dotenv()
@@ -88,6 +124,36 @@ def get_symptom_embedding(symptoms: str) -> List[float]:
         st.error(f"Error creating embedding: {str(e)}")
         return None
 
+
+def normalize_zip(zip_code: str) -> str:
+    """Normalize ZIP code to 5-digit string."""
+    digits = "".join(ch for ch in zip_code if ch.isdigit())
+    return digits[:5] if len(digits) >= 5 else digits
+
+
+def is_supported_zip(zip_code: str) -> bool:
+    """Check if ZIP is in supported CA list."""
+    return zip_code in ZIP_CODES_CA
+
+
+def assign_zips_to_doctor(doctor_name: str) -> List[str]:
+    """
+    Deterministically assign a small group of nearby ZIP codes to a doctor.
+    - Uses a hash of the doctor name to pick a center index.
+    - Then takes a window of ZIP_GROUP_SIZE around that index.
+    This gives each doctor 4–5 nearby ZIPs in the supported area.
+    """
+    if not ZIP_LIST:
+        return []
+    n = len(ZIP_LIST)
+    center = abs(hash(doctor_name)) % n
+    half = ZIP_GROUP_SIZE // 2
+    start = max(0, center - half)
+    end = min(n, start + ZIP_GROUP_SIZE)
+    # Adjust start if we're too close to the end
+    start = max(0, end - ZIP_GROUP_SIZE)
+    return ZIP_LIST[start:end]
+
 def find_best_doctor(symptoms_embedding: List[float], top_k: int = 3) -> List[Dict]:
     """Find the best matching doctors using vector similarity search, filtered by availability"""
     try:
@@ -101,13 +167,33 @@ def find_best_doctor(symptoms_embedding: List[float], top_k: int = 3) -> List[Di
         doctors = []
         if results['ids'] and len(results['ids'][0]) > 0:
             for i in range(len(results['ids'][0])):
+                metadata = results['metadatas'][0][i]
+                doctor_name = metadata.get("doctor_name", "N/A")
+                speciality = metadata.get("speciality", "N/A")
+
+                # Existing metadata may contain a single zip or list of zips
+                meta_zips: List[str] = []
+                if "zip_codes" in metadata and isinstance(metadata["zip_codes"], list):
+                    meta_zips = [normalize_zip(z) for z in metadata["zip_codes"] if z]
+                elif "zip_code" in metadata or "zipcode" in metadata:
+                    z = metadata.get("zip_code") or metadata.get("zipcode")
+                    if z:
+                        meta_zips = [normalize_zip(str(z))]
+
+                if meta_zips:
+                    zip_codes = [z for z in meta_zips if is_supported_zip(z)]
+                else:
+                    # Deterministically assign 4–5 nearby ZIPs
+                    zip_codes = assign_zips_to_doctor(doctor_name)
+
                 doctor_info = {
                     'id': results['ids'][0][i],
                     'document': results['documents'][0][i],
-                    'doctor_name': results['metadatas'][0][i].get('doctor_name', 'N/A'),
-                    'speciality': results['metadatas'][0][i].get('speciality', 'N/A'),
+                    'doctor_name': doctor_name,
+                    'speciality': speciality,
+                    'zip_codes': zip_codes,
                     'distance': results['distances'][0][i],
-                    'similarity_score': 1 - results['distances'][0][i]  # Convert distance to similarity
+                    'similarity_score': 1 - results['distances'][0][i],  # used internally only
                 }
                 doctors.append(doctor_info)
         
@@ -165,7 +251,7 @@ st.set_page_config(
 st.sidebar.title("🏥 Navigation")
 page = st.sidebar.radio(
     "Select Page",
-    ["🏠 Home - Doctor Matching", "🔬 Clinical Decision Support", "⚙️ Admin Panel"],
+    ["🏠 Home - Doctor Matching", "📅 My Appointments", "🔬 Clinical Decision Support", "⚙️ Admin Panel"],
     index=0
 )
 
@@ -173,6 +259,17 @@ page = st.sidebar.radio(
 if page == "🏠 Home - Doctor Matching":
     st.title("🏥 Doctor-Patient Matching System")
     st.markdown("Enter your symptoms below to find the best matching doctor for your needs.")
+    # Show last booking result so it survives rerun and user can see success or error
+    if "last_booking_result" in st.session_state and st.session_state.last_booking_result:
+        r = st.session_state.last_booking_result
+        if r.get("ok"):
+            st.success(f"✅ **Last booking:** {r.get('msg', '')} — {r.get('doctor_name', '')} on {r.get('date')} at {r.get('time')}.")
+        else:
+            st.error(f"❌ **Last booking failed:** {r.get('msg', '')}")
+        if st.button("Dismiss", key="dismiss_booking_result"):
+            st.session_state.last_booking_result = None
+            st.rerun()
+        st.divider()
 
 # Input section
 col1, col2 = st.columns([2, 1])
@@ -188,8 +285,14 @@ with col2:
     st.markdown("### Search Options")
     top_k = st.slider("Number of doctors to show", 1, 5, 3)
     show_ai_recommendation = st.checkbox("Show AI recommendation", value=True)
+    zip_input = st.text_input(
+        "Patient ZIP code (optional)",
+        placeholder="e.g., 92103",
+        max_chars=10,
+        help="Used to find doctors assigned to this ZIP code"
+    )
 
-# Search button
+# Search button: store results in session state so "Confirm booking" is still rendered on next run
 if st.button("🔍 Find Doctor", type="primary", use_container_width=True):
     if not symptoms_input.strip():
         st.warning("Please enter your symptoms before searching.")
@@ -202,62 +305,169 @@ if st.button("🔍 Find Doctor", type="primary", use_container_width=True):
                 # Step 2: Find best matching doctors
                 doctors = find_best_doctor(symptoms_embedding, top_k=top_k)
                 
+                # Optional ZIP-based filtering
+                zip_filter = normalize_zip(zip_input) if zip_input else ""
+                if zip_filter:
+                    if not is_supported_zip(zip_filter):
+                        st.warning(f"ZIP code {zip_filter} is outside the supported service area.")
+                        doctors = []
+                    else:
+                        # Keep only doctors whose assigned ZIP group contains this ZIP
+                        doctors = [
+                            d for d in doctors
+                            if any(normalize_zip(z) == zip_filter for z in d.get('zip_codes', []))
+                        ]
+                
                 if doctors:
+                    st.session_state.last_doctors = doctors
+                    st.session_state.last_symptoms = symptoms_input
                     st.success(f"Found {len(doctors)} matching doctor(s)!")
-                    
-                    # Display results (without explicit percentage match score)
-                    for idx, doctor in enumerate(doctors, 1):
-                        with st.container():
-                            col1, _ = st.columns([3, 1])
-                            
-                            with col1:
-                                st.markdown(f"### 👨‍⚕️ Doctor {idx}: {doctor['doctor_name']}")
-                                st.markdown(f"**Speciality:** {doctor['speciality']}")
-                                
-                                # Check availability status
-                                try:
-                                    is_available = sync_check_doctor_availability(doctor['doctor_name'])
-                                    if is_available:
-                                        st.success("✅ Available")
-                                        # Booking button
-                                        if st.button(f"📅 Book Appointment", key=f"book_{doctor['doctor_name']}_{idx}"):
-                                            try:
-                                                if sync_book_doctor(doctor['doctor_name']):
-                                                    st.success(f"✅ Successfully booked appointment with {doctor['doctor_name']}!")
-                                                    st.rerun()
-                                                else:
-                                                    st.error("❌ Doctor is no longer available. Please search again.")
-                                            except Exception:
-                                                st.info("ℹ️ Booking service temporarily unavailable")
-                                    else:
-                                        st.warning("⏸️ Currently Unavailable")
-                                except Exception:
-                                    # If DB unavailable, show as available (fail-safe for demo)
-                                    st.success("✅ Available")
-                                    if st.button(f"📅 Book Appointment", key=f"book_{doctor['doctor_name']}_{idx}"):
-                                        st.info("ℹ️ Booking feature requires database connection")
-                                
-                                if show_ai_recommendation and idx == 1:
-                                    recommendation = get_doctor_recommendation(symptoms_input)
-                                    if recommendation:
-                                        with st.expander("💡 AI Recommendation", expanded=True):
-                                            st.write(recommendation)
-                            
-                            st.divider()
-                    
-                    # Show selected doctor prominently
-                    if len(doctors) > 0:
-                        best_doctor = doctors[0]
-                        st.markdown("---")
-                        st.markdown("### ✅ Recommended Doctor")
-                        st.info(
-                            f"**{best_doctor['doctor_name']}** - {best_doctor['speciality']}\n\n"
-                            "Based on your symptoms, this doctor is recommended as the best available match."
-                        )
                 else:
+                    st.session_state.last_doctors = []
                     st.error("No matching doctors found. Please try rephrasing your symptoms.")
             else:
                 st.error("Failed to process your symptoms. Please try again.")
+
+# Always show last search results (and booking UI) on Home when we have them so "Confirm booking" click is not lost
+if page == "🏠 Home - Doctor Matching" and st.session_state.get("last_doctors"):
+    doctors = st.session_state.last_doctors
+    symptoms_for_recommendation = st.session_state.get("last_symptoms", "")
+    # Log selected doctors when recommendation is shown
+    _log.info(
+        "Recommendation shown for %s doctor(s): %s",
+        len(doctors),
+        [(d.get("doctor_name"), d.get("speciality")) for d in doctors],
+    )
+    # Display results (without explicit percentage match score)
+    for idx, doctor in enumerate(doctors, 1):
+        with st.container():
+            col1, _ = st.columns([3, 1])
+            with col1:
+                st.markdown(f"### 👨‍⚕️ Doctor {idx}: {doctor['doctor_name']}")
+                st.markdown(f"**Speciality:** {doctor['speciality']}")
+                if doctor.get('zip_codes'):
+                    zlist = ", ".join(sorted(set(doctor['zip_codes'])))
+                    st.markdown(f"**Service ZIPs:** {zlist}")
+                # Check availability status
+                try:
+                    is_available = sync_check_doctor_availability(doctor['doctor_name'])
+                    cloud_sql = is_cloud_sql_available()
+                    if is_available or cloud_sql:
+                        if is_available and not cloud_sql:
+                            st.success("✅ Available")
+                        elif cloud_sql:
+                            st.success("✅ Available (book with date & time below)")
+                        if cloud_sql:
+                            with st.expander(f"📅 Book slot with {doctor['doctor_name']} (date & time → Cloud SQL)", expanded=True):
+                                appt_date = st.date_input("Date", value=date.today(), min_value=date.today(), key=f"date_{idx}_{doctor['doctor_name']}")
+                                doctor_id = get_doctor_id_by_name(doctor['doctor_name'])
+                                if doctor_id is not None:
+                                    slots_available = get_available_slots(doctor_id, appt_date)
+                                    slot_labels = [t.strftime("%I:%M %p") for t in slots_available]
+                                    if not slot_labels:
+                                        st.warning("No slots left on this date.")
+                                    else:
+                                        chosen_slot_label = st.selectbox("Time (9 AM–5 PM)", slot_labels, key=f"slot_{idx}_{doctor['doctor_name']}")
+                                        if st.button("Confirm booking", key=f"confirm_{idx}_{doctor['doctor_name']}"):
+                                            try:
+                                                _log.info("App: Confirm booking clicked doctor=%s doctor_id=%s date=%s chosen_slot=%s",
+                                                          doctor['doctor_name'], doctor_id, appt_date, chosen_slot_label)
+                                                user_id = get_or_create_user(DEFAULT_USER_EMAIL)
+                                                if user_id is None:
+                                                    _log.warning("App: get_or_create_user returned None")
+                                                    st.session_state.last_booking_result = {"ok": False, "msg": "Could not get user (jas@gmail.com)."}
+                                                    st.error("Could not get user (jas@gmail.com).")
+                                                    st.rerun()
+                                                else:
+                                                    slot_time = slots_available[slot_labels.index(chosen_slot_label)]
+                                                    _log.info("App: calling book_appointment doctor_id=%s user_id=%s date=%s slot_time=%s",
+                                                              doctor_id, user_id, appt_date, slot_time)
+                                                    ok, msg = book_appointment(doctor_id, user_id, appt_date, slot_time)
+                                                    _log.info("App: book_appointment returned ok=%s msg=%s", ok, msg)
+                                                    st.session_state.last_booking_result = {
+                                                        "ok": ok, "msg": msg,
+                                                        "doctor_name": doctor['doctor_name'],
+                                                        "date": str(appt_date), "time": chosen_slot_label,
+                                                    }
+                                                    if ok:
+                                                        st.success(f"✅ {msg} — {doctor['doctor_name']} on {appt_date} at {chosen_slot_label}.")
+                                                        try:
+                                                            sync_book_doctor(doctor['doctor_name'])
+                                                        except Exception:
+                                                            pass
+                                                        st.rerun()
+                                                    else:
+                                                        st.error(msg)
+                                                        st.rerun()
+                                            except Exception as e:
+                                                st.session_state.last_booking_result = {"ok": False, "msg": str(e)}
+                                                st.error(f"Booking error: {e}")
+                                                st.rerun()
+                                else:
+                                    st.info("Doctor ID could not be resolved.")
+                        else:
+                            if st.button(f"📅 Book Appointment", key=f"book_{doctor['doctor_name']}_{idx}"):
+                                try:
+                                    if sync_book_doctor(doctor['doctor_name']):
+                                        st.success(f"✅ Successfully booked appointment with {doctor['doctor_name']}!")
+                                        st.rerun()
+                                    else:
+                                        st.error("❌ Doctor is no longer available. Please search again.")
+                                except Exception:
+                                    st.info("ℹ️ Booking service temporarily unavailable")
+                    else:
+                        st.warning("⏸️ Currently Unavailable")
+                except Exception:
+                    st.success("✅ Available")
+                    if st.button(f"📅 Book Appointment", key=f"book_{doctor['doctor_name']}_{idx}"):
+                        st.info("ℹ️ Booking feature requires database connection")
+                if show_ai_recommendation and idx == 1:
+                    recommendation = get_doctor_recommendation(symptoms_for_recommendation)
+                    if recommendation:
+                        with st.expander("💡 AI Recommendation", expanded=True):
+                            st.write(recommendation)
+            st.divider()
+    # Recommended doctor summary
+    if doctors:
+        best_doctor = doctors[0]
+        st.markdown("---")
+        st.markdown("### ✅ Recommended Doctor")
+        st.info(
+            f"**{best_doctor['doctor_name']}** - {best_doctor['speciality']}\n\n"
+            "Based on your symptoms, this doctor is recommended as the best available match."
+        )
+
+elif page == "📅 My Appointments":
+    st.title("📅 My Appointments")
+    st.markdown("View and manage your booked appointments (Cloud SQL).")
+    if not is_cloud_sql_available():
+        st.warning("Cloud SQL is not connected. Appointments are stored in Cloud SQL — check your connection in the sidebar.")
+    else:
+        appointments = list_appointments_for_user(email=DEFAULT_USER_EMAIL)
+        if not appointments:
+            st.info("No appointments yet. Book a slot from **Home - Doctor Matching** after finding a doctor.")
+        else:
+            st.success(f"**{len(appointments)}** appointment(s) found for **{DEFAULT_USER_EMAIL}**.")
+            # Optional: filter from date
+            filter_future = st.checkbox("Show only today and future", value=True, key="my_appt_filter")
+            if filter_future:
+                today = date.today().isoformat()
+                appointments = [a for a in appointments if a["appointment_date"] >= today]
+            if not appointments:
+                st.caption("No appointments match the filter.")
+            else:
+                view_tab = st.radio("View", ["List", "Table"], horizontal=True, key="my_appt_view")
+                if view_tab == "List":
+                    for a in appointments:
+                        with st.container():
+                            st.markdown(f"**{a['doctor_name']}** — {a['speciality']}")
+                            st.caption(f"📅 {a['appointment_date']} at {a['slot_start_time']} · #{a['appointment_id']} · {a['status']}")
+                            st.divider()
+                else:
+                    import pandas as pd
+                    df = pd.DataFrame(appointments)
+                    df = df[["appointment_id", "appointment_date", "slot_start_time", "doctor_name", "speciality", "status"]]
+                    st.dataframe(df, use_container_width=True, hide_index=True)
 
 elif page == "🔬 Clinical Decision Support":
     st.title("🔬 Clinical Decision Support")
@@ -599,6 +809,13 @@ if page == "🏠 Home - Doctor Matching":
         Database: {CHROMA_DATABASE}
         """)
         
+        st.markdown("### ☁️ Cloud SQL (appointments)")
+        cloud_status = get_cloud_sql_status()
+        if is_cloud_sql_available():
+            st.success(f"✅ {cloud_status}")
+        else:
+            st.caption(f"❌ {cloud_status}")
+        
         if st.button("🔄 Refresh Connection"):
             st.cache_resource.clear()
             st.rerun()
@@ -618,22 +835,61 @@ if page == "🏠 Home - Doctor Matching":
             except Exception as e:
                 st.error(f"Error fetching doctors: {str(e)}")
         
+        if is_cloud_sql_available():
+            st.markdown("### 📅 My Appointments (Cloud SQL)")
+            appointments = list_appointments_for_user(email=DEFAULT_USER_EMAIL)
+            if appointments:
+                for a in appointments[:10]:
+                    st.caption(f"{a['appointment_date']} {a['slot_start_time']} — {a['doctor_name']}")
+                if len(appointments) > 10:
+                    st.caption(f"... and {len(appointments) - 10} more")
+            else:
+                st.caption("No appointments yet.")
+        
         if st.button("🔄 Sync Doctors from ChromaDB"):
             try:
-                # Get all doctors from ChromaDB
-                all_results = collection.get()
+                # Get all doctors from ChromaDB (request metadatas and documents so names are present)
+                all_results = collection.get(include=["metadatas", "documents"])
                 doctors_to_sync = []
-                if all_results.get('ids'):
-                    for i, doc_id in enumerate(all_results['ids']):
-                        doctor_info = {
-                            'id': doc_id,
-                            'doctor_name': all_results['metadatas'][i].get('doctor_name', 'N/A'),
-                            'speciality': all_results['metadatas'][i].get('speciality', 'N/A')
-                        }
-                        doctors_to_sync.append(doctor_info)
-                
+                ids = all_results.get("ids") or []
+                metadatas = all_results.get("metadatas") or []
+                documents = all_results.get("documents") or []
+                if ids and isinstance(ids[0], list):
+                    ids = ids[0]
+                    metadatas = metadatas[0] if metadatas else []
+                    documents = documents[0] if documents else []
+                if not metadatas:
+                    metadatas = [None] * len(ids)
+                if not documents:
+                    documents = [""] * len(ids)
+                for i, doc_id in enumerate(ids):
+                    meta = metadatas[i] if i < len(metadatas) else {}
+                    if meta is None:
+                        meta = {}
+                    doc_text = documents[i] if i < len(documents) else ""
+                    name = (meta.get("doctor_name") or meta.get("name") or "").strip() if meta else ""
+                    if not name and doc_text:
+                        name = (doc_text.split("\n")[0] or doc_text[:80] or "N/A").strip()
+                    if not name:
+                        name = "N/A"
+                    speciality = (meta.get("speciality") or meta.get("specialty") or "General").strip() if meta else "General"
+                    doctors_to_sync.append({
+                        "id": doc_id,
+                        "doctor_name": name,
+                        "speciality": speciality,
+                    })
                 sync_sync_doctors(doctors_to_sync)
                 st.success(f"✅ Synced {len(doctors_to_sync)} doctors to database!")
+                # Update Cloud SQL doctors so My Appointments shows real names instead of "Doctor 132"
+                if is_cloud_sql_available() and doctors_to_sync:
+                    n, msg = sync_doctors_to_cloud_sql(doctors_to_sync)
+                    if n > 0:
+                        st.success(f"✅ {msg}")
+                    else:
+                        if msg and "not available" not in msg.lower():
+                            st.error(f"Cloud SQL doctor names: {msg}")
+                        else:
+                            st.warning("Cloud SQL doctor names not updated. Check that your DB user has UPDATE on the doctors table.")
             except Exception as e:
                 st.error(f"Error syncing doctors: {str(e)}")
 else:
