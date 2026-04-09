@@ -9,6 +9,7 @@ from mistralai import Mistral
 import chromadb
 from dotenv import load_dotenv
 import streamlit as st
+import time
 
 load_dotenv()
 
@@ -517,7 +518,21 @@ def process_patient_dataset(file_path: str, mistral_client: Mistral, progress_ba
         }
 
 
-def search_similar_cases(symptoms: str, mistral_client: Mistral, top_k: int = 5) -> List[Dict]:
+def _is_transient_api_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    transient_markers = [
+        "status 503",
+        "overflow",
+        "upstream connect error",
+        "disconnect/reset before headers",
+        "timed out",
+        "timeout",
+        "rate limit",
+    ]
+    return any(x in m for x in transient_markers)
+
+
+def search_similar_cases(symptoms: str, mistral_client: Mistral, top_k: int = 5) -> Optional[List[Dict]]:
     """
     Search for similar past patient cases based on symptoms
     
@@ -529,40 +544,52 @@ def search_similar_cases(symptoms: str, mistral_client: Mistral, top_k: int = 5)
     Returns:
         List of similar patient cases with metadata
     """
-    try:
-        # Create embedding for symptoms
-        embedding_response = mistral_client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            inputs=[symptoms]
-        )
-        symptoms_embedding = embedding_response.data[0].embedding
-        
-        # Search in patient collection
-        collection = get_patient_collection()
-        
-        results = collection.query(
-            query_embeddings=[symptoms_embedding],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"]
-        )
-        
-        similar_cases = []
-        if results['ids'] and len(results['ids'][0]) > 0:
-            for i in range(len(results['ids'][0])):
-                case = {
-                    'id': results['ids'][0][i],
-                    'document': results['documents'][0][i],
-                    'metadata': results['metadatas'][0][i],
-                    'distance': results['distances'][0][i],
-                    'similarity_score': 1 - results['distances'][0][i]
-                }
-                similar_cases.append(case)
-        
-        return similar_cases
-        
-    except Exception as e:
-        st.error(f"Error searching similar cases: {str(e)}")
-        return []
+    retries = 3
+    backoff_seconds = [0.6, 1.2, 2.0]
+
+    for attempt in range(retries):
+        try:
+            # Create embedding for symptoms
+            embedding_response = mistral_client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                inputs=[symptoms]
+            )
+            symptoms_embedding = embedding_response.data[0].embedding
+            
+            # Search in patient collection
+            collection = get_patient_collection()
+            
+            results = collection.query(
+                query_embeddings=[symptoms_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            similar_cases = []
+            if results['ids'] and len(results['ids'][0]) > 0:
+                for i in range(len(results['ids'][0])):
+                    case = {
+                        'id': results['ids'][0][i],
+                        'document': results['documents'][0][i],
+                        'metadata': results['metadatas'][0][i],
+                        'distance': results['distances'][0][i],
+                        'similarity_score': 1 - results['distances'][0][i]
+                    }
+                    similar_cases.append(case)
+            
+            return similar_cases
+
+        except Exception as e:
+            msg = str(e)
+            is_last_attempt = attempt == (retries - 1)
+            if _is_transient_api_error(msg) and not is_last_attempt:
+                # Retry short-lived API/gateway issues.
+                time.sleep(backoff_seconds[attempt] if attempt < len(backoff_seconds) else 2.0)
+                continue
+            st.error(f"Error searching similar cases: {msg}")
+            return None
+
+    return None
 
 
 def get_collection_stats() -> Dict:

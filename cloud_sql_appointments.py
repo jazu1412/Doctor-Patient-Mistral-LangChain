@@ -5,6 +5,9 @@ Set CLOUD_SQL_* in .env or leave unset to skip Cloud SQL (app still works with T
 import os
 import logging
 import sys
+import hashlib
+import hmac
+import secrets
 from typing import List, Dict, Optional, Tuple
 from datetime import date, time, timedelta
 from dotenv import load_dotenv
@@ -49,6 +52,9 @@ _connection = None
 _connection_lock = threading.Lock()
 _last_connection_error = None  # So UI can show why connection failed
 
+_PASSWORD_ALGO = "pbkdf2_sha256"
+_PASSWORD_ITERATIONS = 240000
+
 
 def _get_conn(reconnect: bool = False):
     """Get MySQL connection; returns None if Cloud SQL not configured."""
@@ -68,6 +74,16 @@ def _get_conn(reconnect: bool = False):
         if reconnect:
             _logger.debug("Reconnect requested, clearing connection")
             _connection = None
+        # Validate existing connection before reuse.
+        if _connection is not None:
+            try:
+                _connection.ping(reconnect=True)
+            except Exception:
+                try:
+                    _connection.close()
+                except Exception:
+                    pass
+                _connection = None
         if _connection is None or not getattr(_connection, "open", True):
             try:
                 if _connection is not None:
@@ -126,12 +142,282 @@ def get_or_create_user(email: str = DEFAULT_USER_EMAIL) -> Optional[int]:
         pass  # keep connection open for reuse
 
 
+def _hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        _PASSWORD_ITERATIONS,
+    ).hex()
+    return f"{_PASSWORD_ALGO}${_PASSWORD_ITERATIONS}${salt}${digest}"
+
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        algo, iters_s, salt, expected = encoded.split("$", 3)
+        if algo != _PASSWORD_ALGO:
+            return False
+        iters = int(iters_s)
+    except Exception:
+        return False
+    actual = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        iters,
+    ).hex()
+    return hmac.compare_digest(actual, expected)
+
+
+def ensure_auth_tables() -> bool:
+    """Create app_users table for login/signup if missing."""
+    # Use a fresh connection to avoid stale-socket issues after long idle periods.
+    conn = _get_conn(reconnect=True)
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_users (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    email VARCHAR(255) NOT NULL UNIQUE,
+                    full_name VARCHAR(255) NULL,
+                    role ENUM('patient', 'doctor') NOT NULL,
+                    password_hash VARCHAR(512) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        _logger.warning("ensure_auth_tables failed: %s", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def signup_auth_user(email: str, password: str, role: str, full_name: str = "") -> Tuple[bool, str]:
+    """Create a doctor/patient login account in Cloud SQL."""
+    conn = _get_conn(reconnect=True)
+    if not conn:
+        return False, "Cloud SQL not available"
+    email_n = (email or "").strip().lower()
+    role_n = (role or "").strip().lower()
+    full_name_n = (full_name or "").strip()
+    if role_n not in ("patient", "doctor"):
+        return False, "Role must be patient or doctor"
+    if "@" not in email_n:
+        return False, "Please enter a valid email"
+    if len(password or "") < 6:
+        return False, "Password must be at least 6 characters"
+    try:
+        ensure_auth_tables()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM app_users WHERE email = %s", (email_n,))
+            if cur.fetchone():
+                return False, "Email already registered"
+            cur.execute(
+                """
+                INSERT INTO app_users (email, full_name, role, password_hash)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (email_n, full_name_n or None, role_n, _hash_password(password)),
+            )
+            conn.commit()
+        # Keep appointments users table consistent for patient bookings.
+        get_or_create_user(email_n)
+        return True, "Signup successful"
+    except Exception as e:
+        _logger.warning("signup_auth_user failed: %s", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, str(e)
+
+
+def login_auth_user(email: str, password: str) -> Tuple[bool, str, Optional[Dict]]:
+    """Authenticate app user by email/password."""
+    conn = _get_conn()
+    if not conn:
+        return False, "Cloud SQL not available", None
+    email_n = (email or "").strip().lower()
+    try:
+        ensure_auth_tables()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, email, full_name, role, password_hash FROM app_users WHERE email = %s",
+                (email_n,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, "User not found", None
+            if not _verify_password(password or "", row.get("password_hash", "")):
+                return False, "Invalid email or password", None
+            user = {
+                "id": row["id"],
+                "email": row["email"],
+                "full_name": row.get("full_name") or "",
+                "role": row["role"],
+            }
+            return True, "Login successful", user
+    except Exception as e:
+        _logger.warning("login_auth_user failed: %s", e)
+        return False, str(e), None
+
+
+def _normalize_doctor_name(name: str) -> str:
+    return " ".join(str(name or "").strip().split())
+
+
+def _is_placeholder_name(name: str) -> bool:
+    n = _normalize_doctor_name(name).casefold()
+    return n.startswith("doctor ")
+
+
+def _deterministic_bucket_id(doctor_name: str) -> int:
+    digest = hashlib.sha256(_normalize_doctor_name(doctor_name).casefold().encode("utf-8")).digest()
+    bucket = int.from_bytes(digest[:8], byteorder="big", signed=False) % 200
+    return bucket + 1
+
+
+def _resolve_or_assign_doctor_id(doctor_name: str, speciality: Optional[str] = None) -> Optional[int]:
+    """
+    Return a stable doctor_id for a name, assigning a safe slot when needed.
+
+    Strategy:
+    1) If exact name already exists in doctors, reuse that doctor_id.
+    2) Else probe ids deterministically (hash bucket + linear probing) and claim the
+       first placeholder/empty slot or same-name slot.
+    3) If Cloud SQL is unavailable, return deterministic fallback id.
+    """
+    normalized = _normalize_doctor_name(doctor_name)
+    if not normalized:
+        return None
+    spec = (speciality or "General").strip() or "General"
+
+    conn = _get_conn()
+    if not conn:
+        return _deterministic_bucket_id(normalized)
+
+    try:
+        with conn.cursor() as cur:
+            # First, exact-name lookup (case-insensitive).
+            cur.execute(
+                """
+                SELECT doctor_id
+                FROM doctors
+                WHERE LOWER(TRIM(doctor_name)) = LOWER(TRIM(%s))
+                LIMIT 1
+                """,
+                (normalized,),
+            )
+            row = cur.fetchone()
+            if row and row.get("doctor_id") is not None:
+                did = int(row["doctor_id"])
+                # Keep speciality fresh for known doctor rows.
+                cur.execute(
+                    "UPDATE doctors SET speciality = %s WHERE doctor_id = %s",
+                    (spec, did),
+                )
+                conn.commit()
+                return did
+
+            base_id = _deterministic_bucket_id(normalized)
+
+            # Deterministic linear probing to avoid collisions.
+            for offset in range(200):
+                cand = ((base_id - 1 + offset) % 200) + 1
+                cur.execute(
+                    "SELECT doctor_name FROM doctors WHERE doctor_id = %s LIMIT 1",
+                    (cand,),
+                )
+                slot = cur.fetchone()
+
+                if not slot:
+                    cur.execute(
+                        "INSERT INTO doctors (doctor_id, doctor_name, speciality) VALUES (%s, %s, %s)",
+                        (cand, normalized, spec),
+                    )
+                    conn.commit()
+                    return cand
+
+                existing_name = _normalize_doctor_name(slot.get("doctor_name", ""))
+                if existing_name.casefold() == normalized.casefold() or _is_placeholder_name(existing_name):
+                    cur.execute(
+                        "UPDATE doctors SET doctor_name = %s, speciality = %s WHERE doctor_id = %s",
+                        (normalized, spec, cand),
+                    )
+                    conn.commit()
+                    return cand
+
+    except Exception as e:
+        _logger.debug("_resolve_or_assign_doctor_id failed for %s: %s", normalized, e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    return _deterministic_bucket_id(normalized)
+
+
 def get_doctor_id_by_name(doctor_name: str) -> Optional[int]:
-    """Map doctor name to doctor_id 1–200 (stable hash). Works even if Cloud SQL doctors table has placeholders."""
+    """
+    Resolve doctor_id from doctors table by name; fallback to deterministic id mapping (1..200).
+
+    NOTE:
+    We must not use Python's built-in hash(), because it is randomized per process.
+    Randomized hashes can map the same doctor to a different doctor_id after restart,
+    causing appointments to show the wrong doctor in JOIN queries.
+    """
     if not doctor_name:
         return None
-    # Stable mapping so same doctor always gets same id
-    return 1 + (abs(hash(doctor_name)) % 200)
+    return _resolve_or_assign_doctor_id(doctor_name)
+
+
+def find_doctor_id_by_name(doctor_name: str) -> Optional[int]:
+    """Lookup-only resolver: return doctor_id if name exists in Cloud SQL doctors table, else None."""
+    normalized = _normalize_doctor_name(doctor_name)
+    if not normalized:
+        return None
+    conn = _get_conn()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT doctor_id
+                FROM doctors
+                WHERE LOWER(TRIM(doctor_name)) = LOWER(TRIM(%s))
+                LIMIT 1
+                """,
+                (normalized,),
+            )
+            row = cur.fetchone()
+            if row and row.get("doctor_id") is not None:
+                return int(row["doctor_id"])
+    except Exception as e:
+        _logger.debug("find_doctor_id_by_name failed for %s: %s", normalized, e)
+    return None
+
+
+def is_doctor_bookable_in_cloud_sql(doctor_name: str, on_date: Optional[date] = None) -> bool:
+    """
+    Return True only if doctor exists in Cloud SQL and has at least one free slot on the date.
+    """
+    doctor_id = find_doctor_id_by_name(doctor_name)
+    if doctor_id is None:
+        return False
+    target_date = on_date or date.today()
+    slots = get_available_slots(doctor_id, target_date)
+    return len(slots) > 0
 
 
 def _normalize_slot_time(value) -> Optional[time]:
@@ -313,10 +599,8 @@ def list_appointments_for_user(
 def sync_doctors_to_cloud_sql(doctors: List[Dict]) -> Tuple[int, str]:
     """
     Update Cloud SQL doctors table with real names/specialities from ChromaDB.
-    First pass: map each ChromaDB doctor to doctor_id by hash; update that row. Names that
-    collide (same hash as an earlier name) are collected as "unused".
-    Second pass: fill remaining rows (doctor_name LIKE 'Doctor %') with unused names so
-    all 200 rows get real names.
+    Uses deterministic assignment with collision handling so each doctor name
+    gets a stable row and is not overwritten by another name.
     Returns (updated_count, message).
     """
     conn = _get_conn(reconnect=True)
@@ -324,55 +608,22 @@ def sync_doctors_to_cloud_sql(doctors: List[Dict]) -> Tuple[int, str]:
         return 0, "Cloud SQL not available"
     updated = 0
     try:
-        with conn.cursor() as cur:
-            used_ids = {}  # doctor_id -> (name, speciality) first assigned
-            unused_names = []  # (name, speciality) that collided with an already-used id
-            for d in doctors:
-                name = d.get("doctor_name") or d.get("name")
-                speciality = d.get("speciality") or d.get("specialty") or "General"
-                if not name or str(name).strip() in ("", "N/A"):
-                    continue
-                name = str(name).strip()
-                doctor_id = get_doctor_id_by_name(name)
-                cur.execute(
-                    "UPDATE doctors SET doctor_name = %s, speciality = %s WHERE doctor_id = %s",
-                    (name, speciality, doctor_id),
-                )
-                if cur.rowcount > 0:
-                    updated += 1
-                    if doctor_id in used_ids:
-                        unused_names.append((name, speciality))
-                    else:
-                        used_ids[doctor_id] = (name, speciality)
-                    _logger.debug("sync_doctors_to_cloud_sql: updated doctor_id=%s -> %s", doctor_id, name[:50])
-            # Second pass: fill all rows that still have placeholder "Doctor %"
-            gap_ids = sorted(set(range(1, 201)) - set(used_ids.keys()))
-            # Pool: unused names first, then cycle through ChromaDB doctors so we have enough for every gap
-            fill_pool = list(unused_names)
-            if len(fill_pool) < len(gap_ids):
-                fill_pool.extend(used_ids.values())
-            j = 0
-            while len(fill_pool) < len(gap_ids) and doctors and j < 2 * len(doctors):
-                d = doctors[j % len(doctors)]
-                name = d.get("doctor_name") or d.get("name")
-                speciality = d.get("speciality") or d.get("specialty") or "General"
-                if name and str(name).strip() not in ("", "N/A"):
-                    fill_pool.append((str(name).strip(), speciality))
-                j += 1
-            filled = 0
-            for i, gid in enumerate(gap_ids):
-                if i < len(fill_pool):
-                    name, spec = fill_pool[i]
-                    cur.execute(
-                        "UPDATE doctors SET doctor_name = %s, speciality = %s WHERE doctor_id = %s",
-                        (name, spec, gid),
-                    )
-                    if cur.rowcount > 0:
-                        updated += 1
-                        filled += 1
-                        _logger.debug("sync_doctors_to_cloud_sql: filled gap doctor_id=%s -> %s", gid, name[:50])
-            conn.commit()
-        _logger.info("sync_doctors_to_cloud_sql: updated %s rows (%s in fill pass)", updated, filled)
+        # Deterministic order so doctor_id assignment doesn't depend on
+        # the incoming list order (important for consistent appointment joins).
+        doctors_sorted = sorted(
+            doctors,
+            key=lambda d: _normalize_doctor_name((d.get("doctor_name") or d.get("name") or "")),
+        )
+        for d in doctors_sorted:
+            name = d.get("doctor_name") or d.get("name")
+            speciality = d.get("speciality") or d.get("specialty") or "General"
+            if not name or str(name).strip() in ("", "N/A"):
+                continue
+            doctor_id = _resolve_or_assign_doctor_id(str(name), str(speciality))
+            if doctor_id is not None:
+                updated += 1
+                _logger.debug("sync_doctors_to_cloud_sql: assigned doctor_id=%s -> %s", doctor_id, str(name)[:50])
+        _logger.info("sync_doctors_to_cloud_sql: updated/assigned %s doctors", updated)
         return updated, f"Updated {updated} doctor(s) in Cloud SQL"
     except Exception as e:
         if conn:
