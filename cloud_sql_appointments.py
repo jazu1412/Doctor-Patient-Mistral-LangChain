@@ -38,6 +38,7 @@ CLOUD_SQL_PORT = int(os.getenv("CLOUD_SQL_PORT", "3306"))
 CLOUD_SQL_USER = os.getenv("CLOUD_SQL_USER", "")
 CLOUD_SQL_PASSWORD = os.getenv("CLOUD_SQL_PASSWORD", "")
 CLOUD_SQL_DATABASE = os.getenv("CLOUD_SQL_DATABASE", "doctor_appointments_db")
+CLOUD_SQL_CONNECT_TIMEOUT = int(os.getenv("CLOUD_SQL_CONNECT_TIMEOUT", "4"))
 
 DEFAULT_USER_EMAIL = "jas@gmail.com"
 
@@ -102,7 +103,7 @@ def _get_conn(reconnect: bool = False):
                     database=CLOUD_SQL_DATABASE or None,
                     charset="utf8mb4",
                     cursorclass=pymysql.cursors.DictCursor,
-                    connect_timeout=15,
+                    connect_timeout=CLOUD_SQL_CONNECT_TIMEOUT,
                 )
                 _logger.info("Connected to Cloud SQL successfully")
             except Exception as e:
@@ -194,6 +195,8 @@ def ensure_auth_tables() -> bool:
             conn.commit()
         return True
     except Exception as e:
+        global _last_connection_error
+        _last_connection_error = str(e)
         _logger.warning("ensure_auth_tables failed: %s", e)
         try:
             conn.rollback()
@@ -636,19 +639,26 @@ def sync_doctors_to_cloud_sql(doctors: List[Dict]) -> Tuple[int, str]:
 
 
 def is_cloud_sql_available() -> bool:
-    """Return True if Cloud SQL is configured, reachable, and schema (users table) exists."""
-    conn = _get_conn()
+    """True if Cloud SQL is reachable and auth table app_users exists (created if missing)."""
+    global _last_connection_error
+    conn = _get_conn(reconnect=True)
     if not conn:
         return False
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT 1")
             cur.fetchone()
-            # Verify we're in the right database (tables exist)
-            cur.execute("SELECT 1 FROM users LIMIT 1")
+        if not ensure_auth_tables():
+            if not _last_connection_error:
+                _last_connection_error = "Could not create or access app_users (check DB user privileges)"
+            return False
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM app_users LIMIT 1")
             cur.fetchone()
-            return True
-    except Exception:
+        return True
+    except Exception as e:
+        _last_connection_error = str(e)
+        _logger.warning("is_cloud_sql_available failed: %s", e)
         return False
 
 
@@ -657,10 +667,9 @@ def get_cloud_sql_status() -> str:
     global _last_connection_error
     if not CLOUD_SQL_HOST or not CLOUD_SQL_USER:
         return "Not configured (set CLOUD_SQL_HOST, CLOUD_SQL_USER in .env)"
-    conn = _get_conn()
+    conn = _get_conn(reconnect=True)
     if not conn:
         err = _last_connection_error or "Connection failed"
-        # Shorten long messages; keep clues like "Access denied", "Unknown database", "timed out"
         if len(err) > 80:
             err = err[:77] + "..."
         return err
@@ -669,8 +678,17 @@ def get_cloud_sql_status() -> str:
             cur.execute("SELECT DATABASE() AS db")
             row = cur.fetchone()
             db_name = row.get("db") or "(none)"
-            cur.execute("SELECT 1 FROM users LIMIT 1")
+        if not ensure_auth_tables():
+            err = _last_connection_error or "Could not ensure app_users table"
+            if len(err) > 80:
+                err = err[:77] + "..."
+            return err
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM app_users LIMIT 1")
             cur.fetchone()
-            return f"Connected (DB: {db_name})"
+        return f"Connected (DB: {db_name})"
     except Exception as e:
-        return f"Schema error: {str(e)[:50]} (is CLOUD_SQL_DATABASE correct?)"
+        msg = str(e)
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        return f"Schema/auth error: {msg} (check CLOUD_SQL_DATABASE and permissions)"

@@ -98,13 +98,22 @@ if missing_vars:
 @st.cache_resource
 def init_clients():
     """Initialize Mistral and ChromaDB clients"""
-    mistral_client = Mistral(api_key=MISTRAL_API_KEY)
-    chroma_client = chromadb.CloudClient(
-        api_key=CHROMA_API_KEY,
-        tenant=CHROMA_TENANT,
-        database=CHROMA_DATABASE
-    )
-    collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    try:
+        mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+        # Validate the exact endpoint used by this app.
+        mistral_client.embeddings.create(model=EMBEDDING_MODEL, inputs=["auth check"])
+    except Exception as e:
+        raise RuntimeError(f"Mistral client init failed: {e}") from e
+
+    try:
+        chroma_client = chromadb.CloudClient(
+            api_key=CHROMA_API_KEY,
+            tenant=CHROMA_TENANT,
+            database=CHROMA_DATABASE
+        )
+        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    except Exception as e:
+        raise RuntimeError(f"Chroma client init failed: {e}") from e
     
     # Initialize database (silently fail if DB unavailable)
     try:
@@ -123,7 +132,10 @@ try:
     mistral_client, collection = init_clients()
     st.session_state.clients_initialized = True
 except Exception as e:
-    st.error(f"Failed to initialize clients: {str(e)}")
+    st.error("Failed to initialize clients.")
+    st.caption(str(e))
+    if "403" in str(e):
+        st.info("403 Forbidden usually means API key/tenant/database mismatch or revoked key.")
     st.stop()
 
 def get_symptom_embedding(symptoms: str) -> List[float]:
@@ -284,7 +296,8 @@ def _filter_doctors_by_age(doctors: List[Dict], patient_age: Optional[int]) -> L
 
 def _symptom_speciality_bonus(symptoms: str, speciality: str, document: str = "") -> float:
     """
-    Lightweight clinical reranking bonus so obvious symptom-speciality pairs rise first.
+    Lightweight clinical reranking so obvious symptom-speciality pairs rise first,
+    while clearly mismatched specialities are slightly demoted.
     """
     text = f"{(symptoms or '').lower()} {(document or '').lower()}"
     spec = (speciality or "").lower()
@@ -293,37 +306,70 @@ def _symptom_speciality_bonus(symptoms: str, speciality: str, document: str = ""
         {
             "symptoms": ["diarrhea", "diarrhoea", "loose stool", "watery stool", "gastro", "stomach upset"],
             "preferred_specs": ["gastro", "infectious disease", "internal medicine", "family medicine", "general medicine"],
+            "avoid_specs": ["urolog", "orthop", "dermat", "ophthalm", "ent", "psychi"],
             "bonus": 0.22,
+            "penalty": 0.08,
         },
         {
             "symptoms": ["chest pain", "palpitations", "shortness of breath", "heart"],
             "preferred_specs": ["cardio"],
+            "avoid_specs": ["dermat", "urolog", "gastro", "ophthalm", "ent"],
             "bonus": 0.22,
+            "penalty": 0.08,
         },
         {
             "symptoms": ["headache", "migraine", "seizure", "dizziness", "neurolog"],
             "preferred_specs": ["neuro"],
+            "avoid_specs": ["urolog", "gastro", "orthop", "dermat"],
             "bonus": 0.2,
+            "penalty": 0.08,
         },
         {
             "symptoms": ["rash", "itch", "skin", "eczema"],
             "preferred_specs": ["dermat"],
+            "avoid_specs": ["urolog", "gastro", "cardio", "ophthalm"],
             "bonus": 0.2,
+            "penalty": 0.08,
         },
         {
             "symptoms": ["cough", "wheez", "asthma", "breath", "lung"],
             "preferred_specs": ["pulmon", "respir"],
+            "avoid_specs": ["urolog", "dermat", "gastro", "ophthalm"],
             "bonus": 0.2,
+            "penalty": 0.08,
+        },
+        {
+            "symptoms": [
+                "genital pain", "groin pain", "testicular pain", "penile pain", "scrotal pain",
+                "burning urination", "painful urination", "dysuria", "blood in urine",
+                "urinary", "prostate", "erectile", "male genital", "genitourinary",
+            ],
+            "preferred_specs": ["urolog", "androlog", "genitourinary", "male reproductive"],
+            "avoid_specs": ["gastro", "dermat", "ophthalm", "ent", "psychi"],
+            "bonus": 0.3,
+            "penalty": 0.12,
+        },
+        {
+            "symptoms": ["pelvic pain", "vaginal", "menstrual", "uterus", "ovary", "pregnan", "female genital"],
+            "preferred_specs": ["gyne", "obstet", "womens health"],
+            "avoid_specs": ["urolog", "gastro", "dermat", "ophthalm"],
+            "bonus": 0.28,
+            "penalty": 0.1,
         },
     ]
 
     total = 0.0
     for rule in rules:
-        if any(k in text for k in rule["symptoms"]) and any(p in spec for p in rule["preferred_specs"]):
+        symptom_matched = any(k in text for k in rule["symptoms"])
+        if not symptom_matched:
+            continue
+        if any(p in spec for p in rule["preferred_specs"]):
             total += rule["bonus"]
+        elif any(a in spec for a in rule.get("avoid_specs", [])):
+            total -= rule.get("penalty", 0.0)
 
-    # Cap the bonus so vector similarity still matters.
-    return min(total, 0.35)
+    # Keep reranking bounded so vector similarity still dominates.
+    return max(min(total, 0.45), -0.2)
 
 
 def find_best_doctor(
@@ -498,8 +544,10 @@ def _current_user_email() -> str:
 def _render_auth_page():
     st.title("🔐 Sign in to continue")
     st.caption("Login or create an account as Patient or Doctor.")
-    if not is_cloud_sql_available():
+    cloud_sql_status = get_cloud_sql_status()
+    if not cloud_sql_status.startswith("Connected"):
         st.error("Cloud SQL is required for authentication. Please check Cloud SQL connectivity.")
+        st.caption(cloud_sql_status)
         st.stop()
 
     ensure_auth_tables()
@@ -718,8 +766,8 @@ if page == "🏠 Home - Doctor Matching" and st.session_state.get("last_doctors"
 
                 # Cloud SQL booking UI (independent of Timescale availability)
                 if cloud_sql_connected:
-                    st.success("✅ Available (book with date & time below)")
-                    with st.expander(f"📅 Book slot with {doctor_name_display} (date & time → Cloud SQL)", expanded=True):
+                    st.success("✅ Available")
+                    with st.expander(f"📅 Book slot with {doctor_name_display}", expanded=True):
                         appt_date = st.date_input(
                             "Date",
                             value=date.today(),
