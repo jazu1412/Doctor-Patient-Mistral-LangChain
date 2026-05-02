@@ -10,5 +10,3 @@ psycopg2-binary>=2.9.0
 pymysql>=1.1.0
 cryptography>=42.0.0
 langchain-core>=0.3.0
-
-

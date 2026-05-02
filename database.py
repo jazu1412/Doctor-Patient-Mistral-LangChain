@@ -1,6 +1,6 @@
 """
-Database module for managing doctor availability in TimescaleDB
-Using synchronous psycopg2 for Streamlit compatibility
+Database module for managing doctor availability in TimescaleDB.
+Uses synchronous psycopg2 (compatible with FastAPI worker threads).
 """
 import psycopg2
 from psycopg2 import pool

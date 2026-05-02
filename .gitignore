@@ -1,5 +1,25 @@
-# Environment variables
+# Environment & secrets (never commit real credentials)
 .env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+frontend/.env
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# Keys, certs, cloud credentials
+*.pem
+*.key
+credentials.json
+*-credentials.json
+service-account*.json
+*-service-account*.json
+google-credentials.json
+.aws/
+gcloud-application-credentials.json
 
 # Python
 __pycache__/
@@ -7,25 +27,40 @@ __pycache__/
 *$py.class
 *.so
 .Python
-
-# Virtual Environment
 venv/
 env/
 ENV/
 .venv
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# IDE
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+dist-ssr/
+
+# IDE & OS
 .vscode/
+!.vscode/extensions.json
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Streamlit
-.streamlit/secrets.toml
+# Runtime logs
+cloud_sql_appointments.log
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-
+# Cursor / local tooling (may contain session or debug data)
+.cursor/

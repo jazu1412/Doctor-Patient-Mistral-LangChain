@@ -15,7 +15,7 @@ import threading
 
 load_dotenv()
 
-# Logger: writes to cloud_sql_appointments.log and to stderr (Streamlit console)
+# Logger: writes to cloud_sql_appointments.log and to stderr
 _logger = logging.getLogger("cloud_sql_appointments")
 _logger.setLevel(logging.DEBUG)
 if not _logger.handlers:
